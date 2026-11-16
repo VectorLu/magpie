@@ -580,18 +580,22 @@ var ownPrice catalog.Price
 // side of a boundary price apart.
 //
 // A local session's call has no provider of ours to price at (its billing
-// provider is the unknown one) but its file names the route it went
-// through; that name prices the call when the catalog lists the very model
-// id under it, and never otherwise: a name models.dev doesn't know, or
-// one whose other models alone would stand for this call's, prices
-// nothing (#4278).
+// provider is the unknown one). A model spelled "<provider>/<model>" is priced
+// at that provider and model without changing the row's billing provider. When
+// the file separately names the route it went through, that name prices the
+// call when the catalog lists the very model id under it, and never otherwise:
+// a name models.dev doesn't know, or one whose other models alone would stand
+// for this call's, prices nothing (#4278).
 func Pricer() func(Record) *catalog.Price {
-	prices := map[[6]string]*catalog.Price{}
-	// each provider's rate windows as the same read of the prices saw
-	// them: the windows are held once (BasePriceIn), each record's rate
-	// read at its own time (provider.RateAt), so a window that opens
-	// mid-page prices only the calls inside it (#2463)
-	windows := map[string][]provider.RateWindow{}
+	type priceEntry struct {
+		price   *catalog.Price
+		windows []provider.RateWindow
+	}
+	// each price's rate windows as the same read of the prices saw them:
+	// the windows are held once (BasePriceIn), each record's rate read at its
+	// own time (provider.RateAt), so a window that opens mid-page prices only
+	// the calls inside it (#2463)
+	prices := map[[6]string]priceEntry{}
 	s := settings.Load()
 	wires := s.Wires()
 	return func(r Record) *catalog.Price {
@@ -607,19 +611,16 @@ func Pricer() func(Record) *catalog.Price {
 		// its calls apart from the provider's other keys
 		key := r.ProviderKeyID
 		k := [6]string{id, r.Model, served, r.SessionProvider, r.Effort, key}
-		if pr, ok := prices[k]; ok {
-			return atWindow(pr, windows[id], r.Time)
+		if cached, ok := prices[k]; ok {
+			return atWindow(cached.price, cached.windows, r.Time)
 		}
 		a := priceAsk{ID: id, Model: r.Model, Served: served, SessionProvider: r.SessionProvider, Effort: r.Effort, Key: key, Unknown: r.Provider == UnknownProvider}
 		pr, ws := basePriceIn(s, wires, a)
 		noteAsk(a.ask(), priceAnswer(pr, ws))
-		if pr != nil {
-			windows[id] = ws
-		}
 		if pr == nil {
 			catalog.Missing() // models.dev may list it by now
 		}
-		prices[k] = pr
+		prices[k] = priceEntry{pr, ws}
 		return atWindow(pr, ws, r.Time)
 	}
 }
@@ -635,6 +636,19 @@ type priceAsk struct {
 // basePriceIn is a's price before its time's rate window, and the
 // provider's windows, as Pricer finds it: nil when none is known.
 func basePriceIn(s settings.Settings, wires map[string]string, a priceAsk) (*catalog.Price, []provider.RateWindow) {
+	basePrice := func(model string) (catalog.Price, bool, []provider.RateWindow) {
+		if a.Unknown {
+			if v, ok, ws := provider.UserBasePriceIn(s, a.ID, model); ok {
+				return v, ok, ws
+			}
+			if pid, rest, ok := strings.Cut(model, "/"); ok {
+				if v, ok, ws := provider.BasePriceIn(s, pid, rest); ok {
+					return v, ok, ws
+				}
+			}
+		}
+		return provider.BaseKeyPriceIn(s, a.ID, a.Key, model)
+	}
 	var pr *catalog.Price
 	var v catalog.Price
 	var ws []provider.RateWindow
@@ -647,15 +661,15 @@ func basePriceIn(s settings.Settings, wires map[string]string, a priceAsk) (*cat
 		if v, ok, ws = provider.UserBasePriceIn(s, a.ID, a.Model); !ok {
 			// the model that ran is priced as itself, what the vendor
 			// billed; with none, the asked-for one's price stands
-			if v, ok, ws = provider.BaseKeyPriceIn(s, a.ID, a.Key, a.Served); !ok {
-				v, ok, ws = provider.BaseKeyPriceIn(s, a.ID, a.Key, a.Model)
+			if v, ok, ws = basePrice(a.Served); !ok {
+				v, ok, ws = basePrice(a.Model)
 			}
 		}
 	} else {
-		v, ok, ws = provider.BaseKeyPriceIn(s, a.ID, a.Key, a.Model)
+		v, ok, ws = basePrice(a.Model)
 	}
 	if !ok && a.Served != "" {
-		v, ok, ws = provider.BaseKeyPriceIn(s, a.ID, a.Key, a.Served)
+		v, ok, ws = basePrice(a.Served)
 	}
 	if ok {
 		pr = &v

@@ -9,7 +9,9 @@ import (
 	"time"
 
 	"github.com/yetone/magpie/internal/catalog"
+	"github.com/yetone/magpie/internal/provider"
 	"github.com/yetone/magpie/internal/sessions"
+	"github.com/yetone/magpie/internal/settings"
 )
 
 // A local session's usage entry names the provider the call went through
@@ -115,5 +117,74 @@ func TestUnknownProviderPricedBySessionProvider(t *testing.T) {
 		if got != want {
 			t.Fatalf("%s cost_usd %q, want %q", id, got, want)
 		}
+	}
+}
+
+// Each provider-prefixed session model keeps its own rate window on a cache
+// hit: another provider's call in between must not replace it.
+func TestSessionPriceWindowsStayWithTheirModel(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, ".cache"))
+	for _, p := range []provider.Provider{
+		{ID: "kimi-code", Name: "Kimi", Key: "k", Chat: "https://kimi.example/v1", RateWindows: []provider.RateWindow{{Start: "00:00", End: "24:00", Rate: 2}}},
+		{ID: "other", Name: "Other", Key: "k", Chat: "https://other.example/v1", RateWindows: []provider.RateWindow{{Start: "00:00", End: "24:00", Rate: 3}}},
+	} {
+		if err := provider.Save(p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	price := settings.StatedPrice(catalog.Price{Input: 1})
+	if err := settings.Save(settings.Settings{ModelPrices: map[string]settings.ModelPrice{
+		"kimi-code/k3.1-pro": price,
+		"other/model":        price,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Now()
+	priceOf := Pricer()
+	cost := func(model string) float64 {
+		r := Record{Provider: UnknownProvider, Model: model, Input: 1, Time: now}
+		pr := priceOf(r)
+		if pr == nil {
+			t.Fatalf("%s is unpriced", model)
+		}
+		return r.CostAt(*pr)
+	}
+	for i, step := range []struct {
+		model string
+		want  float64
+	}{{"kimi-code/k3.1-pro", 2e-6}, {"other/model", 3e-6}, {"kimi-code/k3.1-pro", 2e-6}} {
+		if got := cost(step.model); got != step.want {
+			t.Errorf("step %d %s cost %v, want %v", i, step.model, got, step.want)
+		}
+	}
+}
+
+// A session that names both a provider-prefixed request and another served
+// model is priced as the model that answered, as a gateway call is.
+func TestSessionServedModelPricePrecedesProviderPrefix(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, ".cache"))
+	os.MkdirAll(filepath.Dir(catalog.CachePath()), 0o755)
+	os.WriteFile(catalog.CachePath(), []byte(`{"openai":{"id":"openai","models":{
+	    "gpt-a":{"id":"gpt-a","cost":{"input":1,"output":0}},
+	    "gpt-b":{"id":"gpt-b","cost":{"input":10,"output":0}}}}}`), 0o644)
+	catalog.Reset()
+	t.Cleanup(catalog.Reset)
+
+	r := Record{Provider: UnknownProvider, Model: "openai/gpt-a", Served: "gpt-b", Input: 1, Time: time.Now()}
+	pr := Pricer()(r)
+	if pr == nil {
+		t.Fatal("the served model is unpriced")
+	}
+	if got := r.CostAt(*pr); got != 10e-6 {
+		t.Errorf("cost %v, want the served model's %v", got, 10e-6)
 	}
 }

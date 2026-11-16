@@ -2793,8 +2793,16 @@ var kimiCodeAPI = map[string]string{
 
 // MakerPrice is a model's list price as the first vendor among the presets
 // that makes the models it serves lists it; for a call whose provider has
-// gone since.
+// gone since. A Kimi Code session's provider/model id keeps its API-price
+// alias even when no provider was saved.
 func MakerPrice(model string) (catalog.Price, bool) {
+	if pid, rest, ok := strings.Cut(model, "/"); ok && (pid == "kimi-code" || pid == "kimi-code-cn") {
+		if id, ok := kimiCodeAPI[strings.ToLower(strings.TrimSpace(rest))]; ok {
+			if pr, ok := makerListPrice(id); ok {
+				return pr, true
+			}
+		}
+	}
 	for _, m := range pricedNames(model) {
 		if pr, ok := makerListPrice(m); ok {
 			return pr, true
